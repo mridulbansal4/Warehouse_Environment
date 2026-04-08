@@ -1,0 +1,4 @@
+# Legacy / Docker fallback; prefer pyproject.toml + uv.lock
+openenv-core[core]>=0.2.2
+openai>=1.0.0
+python-dotenv>=1.0.0

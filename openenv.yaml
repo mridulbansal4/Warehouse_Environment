@@ -1,0 +1,8 @@
+spec_version: 1
+name: Warehouse_env
+description: Warehouse slotting optimizer — three graded tasks (easy / medium / hard) with dense rewards.
+type: space
+runtime: fastapi
+app: server.app:app
+port: 8000
+
