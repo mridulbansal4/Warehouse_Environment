@@ -1,13 +1,15 @@
-<<<<<<< HEAD
 ---
 title: Warehouse Slotting OpenEnv
 emoji: 📦
 colorFrom: blue
 colorTo: green
 sdk: docker
-pinned: false
+sdk_version: "5.31.0"
+python_version: "3.11"
+app_file: app.py
 app_port: 8000
-base_path: /web
+base_path: /docs
+pinned: false
 tags:
   - openenv
 ---
@@ -15,6 +17,8 @@ tags:
 # Warehouse slotting (OpenEnv)
 
 Realistic **warehouse slotting** tasks: place SKUs in zones to minimise weighted walking distance (pick frequency × distance to dock) under **capacity**, **oversize (ground-level)**, and **hazardous vs food aisle** rules. The server exposes the standard OpenEnv HTTP + WebSocket API (`reset`, `step`, `state`, `/schema`, `/docs`).
+
+Configuration for [Hugging Face Spaces](https://huggingface.co/docs/hub/spaces-config-reference) is in the YAML block above. With **`sdk: docker`**, the running app is defined by the root **`Dockerfile`**; **`sdk_version`** is required by some validators and is ignored for Docker builds. **`app.py`** re-exports the FastAPI `app` from `server.app` so `app_file` resolves. Open the Space UI at **`/docs`** (Swagger) unless you enable the Gradio web UI (`ENABLE_WEB_INTERFACE`).
 
 ## Motivation
 
@@ -73,12 +77,14 @@ uv run server
 uv run python -m Warehouse_env.server.app
 ```
 
-Docker (from this directory, as on Hugging Face):
+Docker (from this directory):
 
 ```bash
-docker build -t warehouse-openenv:latest -f server/Dockerfile .
+docker build -t warehouse-openenv:latest .
 docker run --rm -p 8000:8000 warehouse-openenv:latest
 ```
+
+(`Dockerfile` at repo root is what Hugging Face Spaces uses; `server/Dockerfile` is the same recipe if you prefer `-f server/Dockerfile`.)
 
 ## Client usage
 
@@ -150,6 +156,8 @@ Warehouse_env/
 ├── pyproject.toml
 ├── uv.lock
 ├── README.md
+├── Dockerfile           # HF Spaces + local docker build (root)
+├── app.py               # HF Spaces app_file → re-exports server.app:app
 ├── __init__.py
 ├── models.py          # Action / Observation / State + domain types
 ├── tasks.py           # Scenarios + TaskConfig.score
@@ -158,7 +166,7 @@ Warehouse_env/
 ├── inference.py       # OpenAI baseline driver
 └── server/
     ├── app.py         # FastAPI app (create_app)
-    ├── Dockerfile
+    ├── Dockerfile     # same image as root Dockerfile
     ├── requirements.txt
     └── Warehouse_env_environment.py
 ```
@@ -172,5 +180,3 @@ openenv push
 ```
 
 (Requires Hugging Face CLI login when prompted.)
-=======
-

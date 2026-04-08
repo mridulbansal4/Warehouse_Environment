@@ -41,3 +41,7 @@ Thumbs.db
 # IDE (uncomment if you do not commit editor settings)
 # .idea/
 # .vscode/
+
+# Run artifacts (keep directory for evaluators / Spaces)
+outputs/*
+!outputs/.gitkeep
