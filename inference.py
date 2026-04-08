@@ -3,8 +3,11 @@
 inference.py — Warehouse Slotting OpenEnv Baseline
 ==================================================
 
-Runs warehouse tasks (easy / medium / hard) locally (grid env under repo root) and emits
-the structured log format expected by the hackathon evaluator.
+Runs warehouse tasks (easy / medium / hard) against the OpenEnv HTTP/WebSocket server
+and emits the structured log format expected by the hackathon evaluator.
+
+This file does **not** import ``env`` (local grid). Phase 2 validation runs in a minimal
+workspace where only the OpenEnv server is available via ``ENV_BASE_URL``.
 
 STDOUT FORMAT (mandatory — do not change):
   [START] task=<task_name> env=<benchmark> model=<model_name>
@@ -12,38 +15,47 @@ STDOUT FORMAT (mandatory — do not change):
   [END]   success=<true|false> steps=<n> score=<score> rewards=<r1,r2,...,rn>
 
 Environment variables:
-  HF_TOKEN              Hugging Face API token (required; set in .env or shell)
+  HF_TOKEN              Hugging Face API token (or API_KEY / OPENAI_API_KEY)
   API_BASE_URL          LLM endpoint      (default: HF router)
   MODEL_NAME            Model id          (default: Qwen/Qwen2.5-7B-Instruct)
-  WAREHOUSE_TASK        Optional: run one of easy, medium, hard only
-  ENV_BASE_URL          Unused for local grid env (OpenEnv server uses a different entry)
+  WAREHOUSE_TASK        Optional: easy, medium, hard only
+  ENV_BASE_URL          OpenEnv server    (default: http://127.0.0.1:7860)
+  BENCHMARK             Logged env name   (default: warehouse-slotting-optimizer)
 """
 
 from __future__ import annotations
 
+import json
 import os
+import re
 import sys
 import textwrap
 from pathlib import Path
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 
-# Grid env, grader, and legacy grid models live in the repo root (parent of this folder).
-_REPO_ROOT = Path(__file__).resolve().parent.parent
-if str(_REPO_ROOT) not in sys.path:
-    sys.path.insert(0, str(_REPO_ROOT))
+_PROJECT_DIR = Path(__file__).resolve().parent
+if str(_PROJECT_DIR) not in sys.path:
+    sys.path.insert(0, str(_PROJECT_DIR))
 
 from dotenv import load_dotenv
 from openai import OpenAI
 
-from env import WarehouseEnv
-from grader import compute_score
-from models import Action, MoveAction, Observation, Slot, SwapAction
+from client import WarehouseEnv
+from grader import compute_episode_score
+from models import WarehouseAction, WarehouseObservation
+from tasks import get_task
 
-_PROJECT_DIR = Path(__file__).resolve().parent
+TASK_ALIAS: Dict[str, str] = {
+    "easy": "single_aisle_rebalance",
+    "medium": "cross_aisle_constrained",
+    "hard": "seasonal_changeover",
+}
+
+ALL_TASKS = ("easy", "medium", "hard")
 
 
 def _load_env_files() -> None:
-    for path in (_PROJECT_DIR / ".env", _REPO_ROOT / ".env", Path.cwd() / ".env"):
+    for path in (_PROJECT_DIR / ".env", Path.cwd() / ".env"):
         if path.is_file():
             load_dotenv(path, encoding="utf-8-sig", override=True)
 
@@ -58,16 +70,15 @@ def _resolve_hf_token() -> str:
 
 _load_env_files()
 
-API_KEY = os.getenv("HF_TOKEN") or os.getenv("API_KEY", "")
+API_KEY = os.getenv("HF_TOKEN") or os.getenv("API_KEY")
 API_BASE_URL = os.getenv("API_BASE_URL", "https://router.huggingface.co/v1")
 MODEL_NAME = os.getenv("MODEL_NAME", "Qwen/Qwen2.5-7B-Instruct")
+ENV_BASE_URL = os.getenv("ENV_BASE_URL", "http://127.0.0.1:7860").rstrip("/")
 BENCHMARK = os.getenv("BENCHMARK", "warehouse-slotting-optimizer")
 
 TEMPERATURE = 0.2
 MAX_TOKENS = 60
 SUCCESS_THRESHOLD = 0.5
-
-ALL_TASKS = ("easy", "medium", "hard")
 
 
 def log_start(task: str, env: str, model: str) -> None:
@@ -101,74 +112,67 @@ def log_end(success: bool, steps: int, score: float, rewards: List[float]) -> No
 
 SYSTEM_PROMPT = textwrap.dedent(
     """
-    You control a warehouse slotting optimizer. Reply with EXACTLY ONE line:
-    either MOVE or SWAP as specified below. No explanation, no markdown.
+    You are a warehouse slotting planner. Reply with ONE JSON object only (no markdown),
+    matching this schema:
+    {"action_type": "<inspect_zone|query_constraint|move_sku|swap_skus|freeze_zone|submit_plan>",
+     "zone_id": "<optional string>",
+     "sku_id": "<optional string>",
+     "sku_to_move": "<optional string>",
+     "target_zone": "<optional string>",
+     "sku_a": "<optional string>",
+     "sku_b": "<optional string>"}
 
-    MOVE SKU_ID row col level
-    SWAP r1 c1 l1 r2 c2 l2
-
-    Use only SKU IDs that appear in the current layout.
+    Goal: reduce weighted walk (pick_frequency * distance_to_dock) by moving high-frequency
+    SKUs to zones with smaller distance_to_dock. Respect oversize (ground only), capacity,
+    and do not put hazardous and food SKUs in the same aisle. Use empty zones for moves.
+    You may inspect_zone or query_constraint before moving. Use submit_plan when done.
     """
 ).strip()
 
 
-def build_user_prompt(state: Observation) -> str:
-    return textwrap.dedent(
-        f"""
-        Current layout (slot -> SKU, null = empty):
-        {state.layout}
-
-        Rules (heuristics):
-        - Higher velocity SKUs → closer to dispatch (0, 0, 0)
-        - Heavy items (>15) → level 0 only when constraints are on
-        - Chemical SKUs must not be adjacent to Food SKUs (when constraints are on)
-
-        Respond with ONE action line only.
-        """
-    ).strip()
-
-
-def parse_action(output: str) -> Action:
-    parts = output.strip().split()
-    if not parts:
-        raise ValueError("Empty action")
-
-    cmd = parts[0].upper()
-    if cmd == "MOVE":
-        if len(parts) < 5:
-            raise ValueError("MOVE requires: MOVE SKU_ID row col level")
-        return Action(
-            action=MoveAction(
-                type="move",
-                sku_id=parts[1],
-                target_slot=Slot(
-                    row=int(parts[2]),
-                    col=int(parts[3]),
-                    level=int(parts[4]),
-                ),
-            )
+def build_user_prompt(obs: WarehouseObservation) -> str:
+    lines: List[str] = [
+        f"task={obs.task_name} step={obs.step_number} move_budget={obs.move_budget}",
+        f"walk_distance={obs.current_walk_distance} baseline={obs.baseline_walk_distance}",
+        f"pending_skus={obs.pending_skus}",
+    ]
+    if obs.last_action_error:
+        lines.append(f"last_error={obs.last_action_error}")
+    lines.append("zones: id -> aisle,level,cap_kg,dock_m,sku_in_slot,frozen")
+    for zid in sorted(obs.zones.keys())[:100]:
+        z = obs.zones[zid]
+        lines.append(
+            f"  {zid}: {z.aisle},{z.level},{z.capacity_kg},{z.distance_to_dock},"
+            f"{z.current_sku},{z.is_frozen}"
         )
-
-    if cmd == "SWAP":
-        if len(parts) < 7:
-            raise ValueError("SWAP requires 6 integers after SWAP")
-        return Action(
-            action=SwapAction(
-                type="swap",
-                slot_a=Slot(row=int(parts[1]), col=int(parts[2]), level=int(parts[3])),
-                slot_b=Slot(row=int(parts[4]), col=int(parts[5]), level=int(parts[6])),
-            )
+    lines.append("skus (id -> zone, kg, freq, haz, food, oversize):")
+    for i, (sid, s) in enumerate(obs.skus.items()):
+        if i >= 50:
+            lines.append(f"  ... ({len(obs.skus) - 50} more)")
+            break
+        lines.append(
+            f"  {sid}: {s.current_zone},{s.weight_kg},{s.pick_frequency},"
+            f"{s.is_hazardous},{s.is_food},{s.is_oversize}"
         )
+    if obs.constraint_violations:
+        lines.append(f"violations_now={len(obs.constraint_violations)}")
+    return "\n".join(lines)
 
-    raise ValueError(f"Unknown action: {parts[0]}")
+
+def _extract_json_object(text: str) -> Dict[str, Any]:
+    text = text.strip()
+    m = re.search(r"\{[\s\S]*\}", text)
+    if not m:
+        raise ValueError("No JSON object in model output")
+    return json.loads(m.group(0))
 
 
-def get_llm_action_line(client: OpenAI, state: Observation) -> str:
+def get_llm_action_json(client: OpenAI, obs: WarehouseObservation) -> str:
     resp = client.chat.completions.create(
         model=MODEL_NAME,
         messages=[
             {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": build_user_prompt(state)},
+            {"role": "user", "content": build_user_prompt(obs)},
         ],
         temperature=TEMPERATURE,
         max_tokens=MAX_TOKENS,
@@ -177,58 +181,107 @@ def get_llm_action_line(client: OpenAI, state: Observation) -> str:
     return " ".join(raw.split())
 
 
+def parse_action(output: str) -> WarehouseAction:
+    data = _extract_json_object(output)
+    return WarehouseAction.model_validate(data)
+
+
+def _episode_score(
+    env_sync: Any,
+    last_obs: WarehouseObservation,
+    task_internal: str,
+    cfg_move_budget: int,
+) -> float:
+    gs = last_obs.env_context.get("grader_score")
+    if gs is not None:
+        return float(gs)
+    st = env_sync.state()
+    if st.last_grader_score is not None:
+        return float(st.last_grader_score)
+    moves_used = cfg_move_budget - st.move_budget_remaining
+    return compute_episode_score(
+        task_internal,
+        zones={k: v.model_dump() for k, v in st.zones.items()},
+        skus={k: v.model_dump() for k, v in st.skus.items()},
+        baseline_distance=st.baseline_walk_distance,
+        steps_used=st.step_count,
+        move_budget_used=moves_used,
+    )
+
+
 def run_warehouse_task(client: OpenAI, task_name: str) -> None:
     all_rewards: List[float] = []
     total_steps = 0
     score = 0.0
     success = False
+    internal_id = TASK_ALIAS[task_name]
+    cfg = get_task(internal_id)
 
     log_start(task=task_name, env=BENCHMARK, model=MODEL_NAME)
 
     try:
-        env = WarehouseEnv(task_name)
-        state = env.reset()
+        with WarehouseEnv(base_url=ENV_BASE_URL).sync() as env_sync:
+            try:
+                result = env_sync.reset(task_id=internal_id)
+                obs = result.observation
+            except Exception as exc:
+                log_step(1, "null", 0.0, True, str(exc))
+                log_end(False, 1, 0.0, [0.0])
+                return
+
+            try:
+                done = result.done
+                while not done and total_steps < cfg.max_steps:
+                    total_steps += 1
+                    error_msg: Optional[str] = None
+                    action_str = "null"
+                    reward = 0.0
+
+                    try:
+                        action_str = get_llm_action_json(client, obs)
+                        if not action_str:
+                            action_str = "null"
+                            raise ValueError("Model returned empty action")
+
+                        action = parse_action(action_str)
+                        action_str = json.dumps(
+                            action.model_dump(mode="json"),
+                            separators=(",", ":"),
+                        )
+                        result = env_sync.step(action)
+                        reward = float(result.reward or 0.0)
+                        done = result.done
+                        obs = result.observation
+                        if obs.last_action_error:
+                            error_msg = obs.last_action_error
+                    except Exception as exc:
+                        if action_str == "null":
+                            action_str = "ERROR"
+                        error_msg = str(exc)
+                        reward = -1.0
+                        done = False
+
+                    all_rewards.append(float(reward))
+                    log_step(total_steps, action_str, float(reward), done, error_msg)
+
+                score = float(
+                    _episode_score(env_sync, obs, internal_id, cfg.move_budget),
+                )
+                score = round(min(max(score, 0.0), 1.0), 3)
+                success = score >= SUCCESS_THRESHOLD
+
+            except Exception as exc:
+                print(
+                    f"[DEBUG] Warehouse task error ({task_name}): {exc}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+            finally:
+                log_end(success, total_steps, score, all_rewards)
+
     except Exception as exc:
         log_step(1, "null", 0.0, True, str(exc))
         log_end(False, 1, 0.0, [0.0])
-        return
-
-    try:
-        done = False
-        while not done and total_steps < env.max_steps:
-            total_steps += 1
-            error_msg: Optional[str] = None
-            action_str = "null"
-            reward = 0.0
-
-            try:
-                action_str = get_llm_action_line(client, state)
-                if not action_str:
-                    action_str = "null"
-                    raise ValueError("Model returned empty action")
-
-                action = parse_action(action_str)
-                state, reward, done, info = env.step(action)
-                if info.get("error"):
-                    error_msg = info["error"]
-            except Exception as exc:
-                if action_str == "null":
-                    action_str = "ERROR"
-                error_msg = str(exc)
-                reward = -1.0
-                done = False
-
-            all_rewards.append(float(reward))
-            log_step(total_steps, action_str, float(reward), done, error_msg)
-
-        score = float(compute_score(env))
-        score = round(min(max(score, 0.0), 1.0), 3)
-        success = score >= SUCCESS_THRESHOLD
-
-    except Exception as exc:
-        print(f"[DEBUG] Warehouse task error ({task_name}): {exc}", file=sys.stderr, flush=True)
-    finally:
-        log_end(success, total_steps, score, all_rewards)
 
 
 def _tasks_to_run() -> List[str]:
@@ -247,24 +300,26 @@ def _tasks_to_run() -> List[str]:
 
 
 def main() -> None:
-    hf_token = _resolve_hf_token()
-    if not hf_token:
+    key = (
+        _resolve_hf_token()
+        or (os.getenv("API_KEY") or "").strip()
+        or (os.getenv("OPENAI_API_KEY") or "").strip()
+    )
+    if not key:
         print(
-            "[DEBUG] HF_TOKEN is missing or empty after loading:\n"
+            "[DEBUG] HF_TOKEN (or API_KEY / OPENAI_API_KEY) is missing after loading:\n"
             f"  - {_PROJECT_DIR / '.env'}\n"
-            f"  - {_REPO_ROOT / '.env'}\n"
             f"  - {Path.cwd() / '.env'}\n"
-            "Add a single line: HF_TOKEN=<your token>\n"
-            "Or export HF_TOKEN in your shell (no quotes needed).",
+            "Set HF_TOKEN for Hugging Face router, or OPENAI_API_KEY for OpenAI.",
             file=sys.stderr,
             flush=True,
         )
         raise SystemExit(1)
 
-    client = OpenAI(base_url=API_BASE_URL, api_key=hf_token)
+    llm = OpenAI(base_url=API_BASE_URL, api_key=key)
 
     for task_name in _tasks_to_run():
-        run_warehouse_task(client, task_name)
+        run_warehouse_task(llm, task_name)
 
 
 if __name__ == "__main__":

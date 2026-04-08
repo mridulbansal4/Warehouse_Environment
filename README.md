@@ -7,8 +7,8 @@ sdk: docker
 sdk_version: "5.31.0"
 python_version: "3.11"
 app_file: app.py
-app_port: 8000
-base_path: /docs
+# Hugging Face Docker Spaces default to container port 7860 — must match uvicorn listen port.
+app_port: 7860
 pinned: false
 tags:
   - openenv
@@ -18,7 +18,7 @@ tags:
 
 Realistic **warehouse slotting** tasks: place SKUs in zones to minimise weighted walking distance (pick frequency × distance to dock) under **capacity**, **oversize (ground-level)**, and **hazardous vs food aisle** rules. The server exposes the standard OpenEnv HTTP + WebSocket API (`reset`, `step`, `state`, `/schema`, `/docs`).
 
-Configuration for [Hugging Face Spaces](https://huggingface.co/docs/hub/spaces-config-reference) is in the YAML block above. With **`sdk: docker`**, the running app is defined by the root **`Dockerfile`**; **`sdk_version`** is required by some validators and is ignored for Docker builds. **`app.py`** re-exports the FastAPI `app` from `server.app` so `app_file` resolves. Open the Space UI at **`/docs`** (Swagger) unless you enable the Gradio web UI (`ENABLE_WEB_INTERFACE`).
+Configuration for [Hugging Face Spaces](https://huggingface.co/docs/hub/spaces-config-reference) is in the YAML block above. With **`sdk: docker`**, the running app is defined by the root **`Dockerfile`**; **`sdk_version`** is required by some validators and is ignored for Docker builds. **`app.py`** re-exports the FastAPI `app` from `server.app` so `app_file` resolves. Swagger UI is at **`/docs`**. **`app_port`** must match the port uvicorn binds (default **7860** for Spaces; override with env **`PORT`** in the container).
 
 ## Motivation
 
@@ -81,7 +81,7 @@ Docker (from this directory):
 
 ```bash
 docker build -t warehouse-openenv:latest .
-docker run --rm -p 8000:8000 warehouse-openenv:latest
+docker run --rm -p 7860:7860 -e PORT=7860 warehouse-openenv:latest
 ```
 
 (`Dockerfile` at repo root is what Hugging Face Spaces uses; `server/Dockerfile` is the same recipe if you prefer `-f server/Dockerfile`.)
@@ -91,7 +91,7 @@ docker run --rm -p 8000:8000 warehouse-openenv:latest
 ```python
 from Warehouse_env import WarehouseAction, WarehouseEnv, ActionType
 
-with WarehouseEnv(base_url="http://127.0.0.1:8000").sync() as env:
+with WarehouseEnv(base_url="http://127.0.0.1:7860").sync() as env:
     r = env.reset(task_id="single_aisle_rebalance")
     r = env.step(
         WarehouseAction(
@@ -116,13 +116,13 @@ Environment variables (aligned with the parent `inference.py`):
 - **`HF_TOKEN`** — Hugging Face token for `API_BASE_URL` (default HF router), or use **`API_KEY`** / **`OPENAI_API_KEY`** for other endpoints.
 - **`API_BASE_URL`** — chat completions base URL (default `https://router.huggingface.co/v1`).
 - **`MODEL_NAME`** — model id (default `Qwen/Qwen2.5-7B-Instruct`).
-- **`ENV_BASE_URL`** — OpenEnv server (default `http://127.0.0.1:8000`).
+- **`ENV_BASE_URL`** — OpenEnv server base URL (default `http://127.0.0.1:7860`; match your server / Space port).
 - **`WAREHOUSE_TASK`** — optional: `easy`, `medium`, or `hard` (maps to internal task ids); default = all three.
 - **`BENCHMARK`** — name in `[START]` line (default `warehouse-slotting-optimizer`).
 
 ```bash
 export HF_TOKEN=...
-export ENV_BASE_URL=http://127.0.0.1:8000   # optional
+export ENV_BASE_URL=http://127.0.0.1:7860   # optional; match server PORT
 
 uv run warehouse-baseline
 # or: uv run python -m Warehouse_env.inference
@@ -163,7 +163,7 @@ Warehouse_env/
 ├── tasks.py           # Scenarios + TaskConfig.score
 ├── grader.py          # Snapshot scoring helper
 ├── client.py          # WebSocket EnvClient
-├── inference.py       # OpenAI baseline driver
+├── inference.py       # OpenAI + OpenEnv WebSocket baseline (no local grid ``env``)
 └── server/
     ├── app.py         # FastAPI app (create_app)
     ├── Dockerfile     # same image as root Dockerfile

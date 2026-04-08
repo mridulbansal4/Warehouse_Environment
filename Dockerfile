@@ -74,10 +74,13 @@ ENV PATH="/app/.venv/bin:$PATH"
 # Set PYTHONPATH so imports work correctly
 ENV PYTHONPATH="/app/env:$PYTHONPATH"
 
-# Health check
-HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
-    CMD curl -f http://localhost:8000/health || exit 1
+# Hugging Face Docker Spaces expect port 7860 by default (README app_port must match).
+ENV PORT=7860
+EXPOSE 7860
 
-# Run the FastAPI server
-# The module path is constructed to work with the /app/env structure
-CMD ["sh", "-c", "cd /app/env && uvicorn server.app:app --host 0.0.0.0 --port 8000"]
+# Health check (uses same PORT as uvicorn)
+HEALTHCHECK --interval=30s --timeout=5s --start-period=120s --retries=5 \
+    CMD sh -c 'curl -fsS "http://127.0.0.1:${PORT}/health" || exit 1'
+
+# Run the FastAPI server (honour PORT for HF / other hosts)
+CMD ["sh", "-c", "cd /app/env && exec uvicorn server.app:app --host 0.0.0.0 --port ${PORT}"]

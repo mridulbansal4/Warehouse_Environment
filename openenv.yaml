@@ -4,5 +4,5 @@ description: Warehouse slotting optimizer — three graded tasks (easy / medium 
 type: space
 runtime: fastapi
 app: server.app:app
-port: 8000
+port: 7860
 
